@@ -1,0 +1,43 @@
+[project]
+name = "nuffield-bot"
+version = "0.1.0"
+description = "Books Reformer Pilates at Nuffield Health Baltimore Wharf the moment slots open."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2]>=0.27.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "tenacity>=8.0",
+    "structlog>=24.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+auto-login = [
+    "playwright>=1.40",
+]
+
+[project.scripts]
+nuffield-bot = "nuffield_bot.__main__:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["nuffield_bot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
