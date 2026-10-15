@@ -65,6 +65,7 @@ async def build_booking_service() -> AsyncIterator[BookingService]:
             token_provider=tokens,
             subscription_key=settings.api_subscription_key,
             origin=settings.api_origin,
+            timezone=settings.timezone,
         )
         keeper = asyncio.create_task(
             keep_fresh(

@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     book_only_after_release: bool = True
     # Join the waitlist when a matching class is full
     join_waitlist: bool = True
+    # How often to re-read our bookings looking for a waitlist place turning
+    # into a real one. Nuffield sends no email for that, and an unnoticed
+    # promotion can become a no-show fee. Skipped during the release burst.
+    booking_check_interval_seconds: float = 600.0
 
     # Only book classes starting within this window (local to the configured timezone)
     class_time_from: time = time(11, 0)

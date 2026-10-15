@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from nuffield_bot.config import Settings
-from nuffield_bot.domain.models import ClassStatus, GymClass
+from nuffield_bot.domain.models import ClassStatus, GymClass, HeldBooking
 from nuffield_bot.domain.ports import ClassRepository, Clock, Notifier
 
 HEARTBEAT_INTERVAL = timedelta(minutes=15)
@@ -29,9 +29,15 @@ class BookingService:
         self._tz = ZoneInfo(settings.timezone)
         self._booked: set[str] = set()
         self._held: set[str] = set()
+        self._failed: set[str] = set()
         self._log = logger or structlog.get_logger()
         self._arm_at = self._next_release_after(clock.now())
         self._last_beat = clock.now() - HEARTBEAT_INTERVAL
+        self._known_status: dict[str, str] = {}
+        self._booking_check_interval = timedelta(
+            seconds=settings.booking_check_interval_seconds
+        )
+        self._last_booking_check = clock.now()
 
     async def run_forever(self) -> None:
         self._log.info(
@@ -47,6 +53,7 @@ class BookingService:
             self._heartbeat(now)
             try:
                 await self._tick(is_burst)
+                await self._check_promotions(now)
             except Exception:
                 self._log.exception("tick.failed")
             await self._clock.sleep(self._next_interval(is_burst))
@@ -77,16 +84,78 @@ class BookingService:
             self._log.exception("preflight.failed")
             await self._notifier.notify(f"⚠️ Startup check failed: {exc!r}")
             return
+        held = await self._seed_already_held()
         armed = self._is_armed(self._clock.now())
-        self._log.info("preflight.ok", matches=len(classes), armed=armed)
+        self._log.info(
+            "preflight.ok", matches=len(classes), armed=armed, already_held=held
+        )
         state = "ARMED" if armed else "holding until release"
         await self._notifier.notify(
             f"🤖 Bot up ({state}). Auth OK, {len(classes)} matching class(es) "
-            f"{self._settings.target_days_ahead} days out. "
+            f"{self._settings.target_days_ahead} days out, {held} already held. "
             f"Release {self._settings.release_hour:02d}:"
             f"{self._settings.release_minute:02d} {self._settings.timezone}, "
             f"dry_run={self._settings.dry_run}."
         )
+
+    async def _seed_already_held(self) -> int:
+        """Prime the dedup set from places we already hold. Without this a
+        restart forgets everything and re-books classes we are already on."""
+        bookings = await self._fetch_bookings()
+        if bookings is None:
+            return 0
+        held = {b.class_id for b in bookings if b.held}
+        self._booked |= held
+        self._known_status = {b.class_id: b.status for b in bookings if b.held}
+        if held:
+            self._log.info("preflight.seeded_booked", count=len(held))
+        return len(held)
+
+    async def _fetch_bookings(self) -> list[HeldBooking] | None:
+        try:
+            return await self._repo.find_my_bookings()
+        except Exception:
+            # Not fatal: worst case we re-POST and the API rejects the dupe.
+            self._log.exception("bookings.lookup_failed")
+            return None
+
+    async def _check_promotions(self, now: datetime) -> None:
+        """Nuffield sends no email when a waitlist place turns into a real
+        booking, so a silent promotion could end in a no-show fee. Poll for the
+        status change ourselves, on a slow cadence and never during the burst.
+        """
+        due = now - self._last_booking_check >= self._booking_check_interval
+        if not due or self._is_burst_window(now):
+            return
+        self._last_booking_check = now
+        bookings = await self._fetch_bookings()
+        if bookings is None:
+            return
+
+        for booking in bookings:
+            previous = self._known_status.get(booking.class_id)
+            if previous is None or previous == booking.status:
+                continue
+            when = booking.start.astimezone(self._tz)
+            self._log.info(
+                "booking.status_changed",
+                class_id=booking.class_id,
+                was=previous,
+                now=booking.status,
+            )
+            if booking.held and previous.casefold() == "waitlist":
+                await self._notifier.notify(
+                    f"🎉 Off the waitlist: {booking.name} on "
+                    f"{when:%a %d %b %H:%M %Z} is now {booking.status}. "
+                    f"Turn up or cancel to avoid a no-show."
+                )
+            elif not booking.held:
+                await self._notifier.notify(
+                    f"⚠️ {booking.name} on {when:%a %d %b %H:%M %Z} is no longer "
+                    f"held (now {booking.status})."
+                )
+        # Track everything we saw, so a place lost then regained still reports.
+        self._known_status = {b.class_id: b.status for b in bookings if b.held}
 
     def _next_interval(self, is_burst: bool) -> float:
         if not is_burst:
@@ -187,17 +256,22 @@ class BookingService:
         result = await self._repo.book(cls.id)
         if result.success:
             self._booked.add(cls.id)
-            prefix = "📋 Joined waitlist for" if is_waitlist else "✅ Booked"
+            self._failed.discard(cls.id)
+            # Trust the response, not the listing: a class that looked open can
+            # still come back WAITLIST if it filled before the POST landed.
+            prefix = "📋 Joined waitlist for" if result.waitlisted else "✅ Booked"
             await self._notifier.notify(
                 f"{prefix} {cls.name} at {when:%a %d %b %H:%M %Z} ({result.message})"
             )
             self._log.info("booking.success", **result.model_dump())
-        else:
+            return
+        self._log.warning("booking.failed", class_id=cls.id, message=result.message)
+        # Keep retrying, but only notify the first time: the loop revisits a
+        # failing class every poll and would otherwise send a message a second.
+        if cls.id not in self._failed:
+            self._failed.add(cls.id)
             await self._notifier.notify(
                 f"❌ Failed to {verb} {cls.name}: {result.message}"
-            )
-            self._log.warning(
-                "booking.failed", class_id=cls.id, message=result.message
             )
 
     def _is_burst_window(self, now: datetime) -> bool:

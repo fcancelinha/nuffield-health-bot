@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import time
+from datetime import UTC, datetime
 
 import structlog
 
@@ -20,6 +21,15 @@ SUBMIT_WAIT_SECONDS = 20
 EXPIRY_SKEW_SECONDS = 60
 # Floor between browser logins, so a run of 401s can't hammer the login page.
 MIN_LOGIN_INTERVAL_SECONDS = 30
+
+
+def human_time(ts: float) -> str:
+    """Unix seconds as local wall-clock, for logs a human has to read at 07:00."""
+    if not ts:
+        return "unknown"
+    return (
+        datetime.fromtimestamp(ts, UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
 
 
 def jwt_exp(token: str) -> float:
@@ -87,7 +97,7 @@ class SeededTokenProvider:
         if not force_refresh and is_fresh(self._seed, self._exp):
             return self._seed  # type: ignore[return-value]
         if self._seed is not None:
-            logger.info("auth.seed_token_exhausted", expired_at=self._exp)
+            logger.info("auth.seed_token_exhausted", expired_at=human_time(self._exp))
             self._seed = None
         return await self._fallback.get_token(force_refresh)
 
@@ -145,7 +155,11 @@ class BrowserTokenProvider:
             token = await self._capture()
             self._cached = token
             self._exp = jwt_exp(token)
-            logger.info("auth.token_refreshed", expires_at=self._exp)
+            logger.info(
+                "auth.token_refreshed",
+                expires_at=human_time(self._exp),
+                valid_for_min=round((self._exp - time.time()) / 60),
+            )
             return token
 
     async def ensure_valid_for(self, seconds: float) -> None:

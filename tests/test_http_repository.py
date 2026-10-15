@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import time
+from datetime import datetime, timedelta
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -38,6 +41,12 @@ def fast_retries(monkeypatch):
     monkeypatch.setattr(
         HttpClassRepository._book_once.retry, "stop", stop_after_attempt(5)
     )
+
+D = "2026-10-23T18:30:00+00:00"
+
+
+def _booking(sfid: str, status: str) -> dict:
+    return {"sfid": sfid, "from_date": D, "my_booking": {"status": status}}
 
 AVAILABLE_ITEM = {
     "sfid": "a2PNz000009djyQMAQ",
@@ -194,7 +203,7 @@ async def test_book_failure_returns_message():
 async def test_book_reports_waitlist_position():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, json={"status": "BOOKED", "heroku_id": "r", "waitlist_position": 3}
+            200, json={"status": "WAITLIST", "heroku_id": "r", "waitlist_position": 3}
         )
 
     repo, client = _repo(handler)
@@ -204,7 +213,29 @@ async def test_book_reports_waitlist_position():
         await client.aclose()
 
     assert result.success is True
+    assert result.waitlisted is True
     assert "WAITLIST #3" in result.message
+
+
+@pytest.mark.asyncio
+async def test_waitlist_position_on_a_confirmed_booking_is_ignored():
+    """The API returns waitlist_position=1 even for confirmed and cancelled
+    bookings, so only `status` decides whether we were waitlisted."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"status": "BOOKED", "heroku_id": "r", "waitlist_position": 1}
+        )
+
+    repo, client = _repo(handler)
+    try:
+        result = await repo.book("c1")
+    finally:
+        await client.aclose()
+
+    assert result.waitlisted is False
+    assert "BOOKED" in result.message
+    assert "#1" not in result.message
 
 
 @pytest.mark.asyncio
@@ -374,6 +405,90 @@ async def test_listing_still_fails_fast_rather_than_blocking_the_loop(fast_retri
         await client.aclose()
 
     assert calls["n"] == 3  # bounded by stop_after_attempt(3)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bookings_are_not_counted_as_held():
+    """A cancelled booking stays in the upcoming list; treating it as held
+    would permanently block re-booking that class."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "count": 3,
+                "next": None,
+                "items": [
+                    _booking("booked-1", "Booked"),
+                    _booking("wait-1", "Waitlist"),
+                    _booking("gone-1", "User Cancelled"),
+                    # Malformed rows must be skipped, not crash seeding.
+                    {"sfid": "no-date", "my_booking": {"status": "Booked"}},
+                ],
+            },
+        )
+
+    repo, client = _repo(handler)
+    try:
+        bookings = await repo.find_my_bookings()
+        held = {b.class_id for b in bookings if b.held}
+    finally:
+        await client.aclose()
+
+    assert held == {"booked-1", "wait-1"}
+
+
+@pytest.mark.asyncio
+async def test_my_bookings_follow_pagination():
+    pages = {
+        1: {"next": "page2", "items": [_booking("a", "Booked")]},
+        2: {"next": None, "items": [_booking("b", "Waitlist")]},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", 1))
+        return httpx.Response(200, json=pages[page])
+
+    repo, client = _repo(handler)
+    try:
+        bookings = await repo.find_my_bookings()
+        held = {b.class_id for b in bookings if b.held}
+    finally:
+        await client.aclose()
+
+    assert held == {"a", "b"}
+
+
+@pytest.mark.asyncio
+async def test_day_window_is_built_in_gym_local_time_during_bst():
+    """Deriving the day in UTC shifts the window an hour during BST and drops
+    classes either side of local midnight."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(request.url.params)
+        return httpx.Response(200, json={"items": []})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    repo = HttpClassRepository(
+        client,
+        StaticTokenProvider("tok"),
+        subscription_key="k",
+        origin="o",
+        timezone="Europe/London",
+    )
+    try:
+        await repo.find_upcoming("loc", ["x"], 8)
+    finally:
+        await client.aclose()
+
+    start = datetime.fromisoformat(seen["from_date"])
+    end = datetime.fromisoformat(seen["to_date"])
+    london = ZoneInfo("Europe/London")
+    # Whatever the UTC offset, the window must be local midnight to midnight.
+    assert start.astimezone(london).time() == dtime(0, 0)
+    assert end.astimezone(london).hour == 23
+    assert timedelta(hours=23) < (end - start) < timedelta(hours=25)
 
 
 def _jwt(exp: float) -> str:

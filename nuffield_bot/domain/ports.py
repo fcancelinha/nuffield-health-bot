@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Protocol
 
-from nuffield_bot.domain.models import BookingResult, GymClass
+from nuffield_bot.domain.models import BookingResult, GymClass, HeldBooking
 
 
 class ClassRepository(Protocol):
@@ -13,6 +13,8 @@ class ClassRepository(Protocol):
     ) -> list[GymClass]: ...
 
     async def book(self, class_id: str) -> BookingResult: ...
+
+    async def find_my_bookings(self) -> list[HeldBooking]: ...
 
 
 class Notifier(Protocol):

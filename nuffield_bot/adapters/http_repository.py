@@ -4,6 +4,8 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 import httpx
 from tenacity import (
@@ -14,12 +16,22 @@ from tenacity import (
     wait_exponential,
 )
 
-from nuffield_bot.domain.models import BookingResult, ClassStatus, GymClass
+from nuffield_bot.domain.models import (
+    BookingResult,
+    ClassStatus,
+    GymClass,
+    HeldBooking,
+)
 from nuffield_bot.domain.ports import TokenProvider
 
 API_BASE = "https://api.nuffieldhealth.com/booking"
 BOOKABLE_ITEMS_URL = f"{API_BASE}/member/1.0/bookable_items/gym/"
 BOOK_URL = f"{API_BASE}/member/1.0/bookings/gym/"
+MY_BOOKINGS_URL = f"{API_BASE}/member/1.0/bookings/"
+# my_booking.status values that mean we still hold a place. Cancelled bookings
+# stay in the upcoming list, and must not block re-booking the same class.
+HELD_STATUSES = frozenset({"booked", "waitlist"})
+MAX_BOOKING_PAGES = 10
 # Keep retrying a throttled booking for this long. Spots went from 7 free to
 # full in ~30s at the last release, so a slow win still beats giving up.
 BOOK_RETRY_BUDGET_SECONDS = 25.0
@@ -65,11 +77,24 @@ class HttpClassRepository:
         token_provider: TokenProvider,
         subscription_key: str,
         origin: str,
+        timezone: str = "Europe/London",
     ) -> None:
         self._client = client
         self._tokens = token_provider
         self._subscription_key = subscription_key
         self._origin = origin
+        self._tz = ZoneInfo(timezone)
+
+    def _day_bounds(self, days_ahead: int) -> tuple[datetime, datetime]:
+        """Midnight-to-midnight for the target day **in the gym's timezone**,
+        expressed in UTC for the wire. Deriving the day in UTC would shift the
+        window by an hour during BST and drop classes either side of midnight.
+        Dates are stepped by calendar day, not 24h, so DST changeovers are safe.
+        """
+        target = (datetime.now(self._tz) + timedelta(days=days_ahead)).date()
+        start = datetime.combine(target, dtime.min, tzinfo=self._tz)
+        end = datetime.combine(target + timedelta(days=1), dtime.min, tzinfo=self._tz)
+        return start.astimezone(UTC), (end - timedelta(milliseconds=1)).astimezone(UTC)
 
     def _base_headers(self) -> dict[str, str]:
         # Prefer a key the provider observed during a real login over the
@@ -110,9 +135,7 @@ class HttpClassRepository:
         name_filters: list[str],
         days_ahead: int,
     ) -> list[GymClass]:
-        target = (datetime.now(UTC) + timedelta(days=days_ahead)).date()
-        from_date = datetime(target.year, target.month, target.day, tzinfo=UTC)
-        to_date = from_date + timedelta(days=1, microseconds=-1000)
+        from_date, to_date = self._day_bounds(days_ahead)
         params = {
             "location": location_id,
             "from_date": from_date.isoformat(timespec="milliseconds"),
@@ -131,6 +154,41 @@ class HttpClassRepository:
             if any(n in item.get("title", "").casefold() for n in needles)
         ]
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.4),
+        retry=retry_if_exception(_is_transient),
+        reraise=True,
+    )
+    async def find_my_bookings(self) -> list[HeldBooking]:
+        """Every upcoming place on the account. Seeds the dedup set across
+        restarts and lets the service spot a waitlist turning into a booking."""
+        bookings: list[HeldBooking] = []
+        for page in range(1, MAX_BOOKING_PAGES + 1):
+            response = await self._request(
+                "GET", MY_BOOKINGS_URL, params={"past": "false", "page": page}
+            )
+            payload = response.json()
+            for item in payload.get("items", []):
+                # One malformed record must not break dedup seeding at startup.
+                if not item.get("sfid") or not item.get("from_date"):
+                    continue
+                mine = item.get("my_booking") or {}
+                status = mine.get("status") or ""
+                bookings.append(
+                    HeldBooking(
+                        class_id=item["sfid"],
+                        name=item.get("title", ""),
+                        start=datetime.fromisoformat(item["from_date"]),
+                        status=status,
+                        held=status.casefold() in HELD_STATUSES,
+                        waitlist_position=int(mine.get("waitlist_position") or 0),
+                    )
+                )
+            if not payload.get("next"):
+                break
+        return bookings
+
     async def book(self, class_id: str) -> BookingResult:
         """Booking is the one request worth fighting for, so a throttled POST is
         retried harder than a listing poll."""
@@ -140,8 +198,7 @@ class HttpClassRepository:
             return BookingResult(
                 success=False,
                 class_id=class_id,
-                message=f"HTTP {exc.response.status_code} after retries: "
-                f"{exc.response.text[:120]}",
+                message=f"HTTP {exc.response.status_code}: {exc.response.text[:160]}",
             )
         except httpx.TransportError as exc:
             return BookingResult(
@@ -157,37 +214,30 @@ class HttpClassRepository:
         reraise=True,
     )
     async def _book_once(self, class_id: str) -> BookingResult:
-        try:
-            response = await self._request(
-                "POST", BOOK_URL, json={"reservation": class_id}
-            )
-        except httpx.HTTPStatusError as exc:
-            # 429 and 5xx must reach the @retry wrapper. Returning a result here
-            # instead would make a "try again in 2 seconds" a permanent loss.
-            if _is_transient(exc):
-                raise
-            return BookingResult(
-                success=False,
-                class_id=class_id,
-                message=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
-            )
+        # HTTP errors propagate: tenacity retries the transient ones and
+        # reraises the rest for book() to turn into a result.
+        response = await self._request("POST", BOOK_URL, json={"reservation": class_id})
         data = response.json()
         status = data.get("status")
         # heroku_id is the booking reference needed to cancel later.
         reference = data.get("heroku_id")
         position = int(data.get("waitlist_position") or 0)
-        # WAITLIST is what the API returns when the class filled before our POST
-        # landed. It is a successful waitlist join, not a failure.
-        if status in ("BOOKED", "WAITLIST"):
-            where = "WAITLIST" if status == "WAITLIST" or position else "BOOKED"
-            suffix = f" #{position}" if position else ""
+        if status not in ("BOOKED", "WAITLIST"):
             return BookingResult(
-                success=True,
-                class_id=class_id,
-                message=f"{where}{suffix} (ref {reference})",
+                success=False, class_id=class_id, message=f"Unexpected status: {status}"
             )
+        # WAITLIST means the class filled between the listing and our POST. It
+        # is a successful waitlist join, not a failure. Only `status` is
+        # authoritative: the API reports waitlist_position=1 even on confirmed
+        # and cancelled bookings, so it says nothing about which we got.
+        waitlisted = status == "WAITLIST"
+        label = "WAITLIST" if waitlisted else "BOOKED"
+        suffix = f" #{position}" if waitlisted and position else ""
         return BookingResult(
-            success=False, class_id=class_id, message=f"Unexpected status: {status}"
+            success=True,
+            class_id=class_id,
+            waitlisted=waitlisted,
+            message=f"{label}{suffix} (ref {reference})",
         )
 
     @staticmethod

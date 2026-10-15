@@ -20,7 +20,14 @@ joins the waitlist if the class is already full, and notifies you over WhatsApp.
 - `BOOK_ONLY_AFTER_RELEASE` (default **true**) holds all booking until the first
   release time *after startup*. This is what lets you start the container the
   night before without it grabbing whatever happens to be open already.
-- Booked class ids are remembered so it never double-books or spams.
+- Booked class ids are remembered so it never double-books or spams. At startup
+  the dedup set is **seeded from places you already hold** (`GET /bookings/`),
+  so a container restart does not re-book a class you are already on. Cancelled
+  bookings stay in that list and are deliberately excluded, otherwise cancelling
+  a class would permanently stop the bot rebooking it.
+- The target day is resolved in `TIMEZONE`, not UTC. Deriving it in UTC shifts
+  the whole query window by an hour during BST and drops classes either side of
+  local midnight.
 - `DRY_RUN` (default **true**) detects and notifies but never sends a real booking.
 - A `heartbeat` line every 15 minutes shows it is alive and how long until it arms.
 
@@ -143,6 +150,7 @@ All settings come from environment variables (or `.env`). See `.env.example`.
 | `DRY_RUN` | `true` | Detect + notify only, never book |
 | `BOOK_ONLY_AFTER_RELEASE` | `true` | Hold booking until the release after startup |
 | `JOIN_WAITLIST` | `true` | Join the waitlist if the class is full |
+| `BOOKING_CHECK_INTERVAL_SECONDS` | `600` | How often to look for waitlist promotions |
 | `CLASS_TIME_FROM` | `11:00` | Earliest class start (local) |
 | `CLASS_TIME_TO` | `14:00` | Latest class start (local) |
 | `POLL_INTERVAL_SECONDS` | `5.0` | Normal poll cadence |
@@ -170,6 +178,11 @@ Uses the WhatsApp Cloud API (Meta Graph). Create a Meta app with WhatsApp, then 
 ## Booking API reference
 
 - List: `GET /booking/member/1.0/bookable_items/gym/?location=<id>&from_date=..&to_date=..`
+- My bookings: `GET /booking/member/1.0/bookings/?past=false&page=N`
+  → `{"count": N, "next": <url|null>, "items": [{"sfid": .., "my_booking":
+  {"status": "Booked"|"Waitlist"|"User Cancelled", "waitlist_position": N,
+  "heroku_id": ..}}]}`. Note `sfid` here is the **class** id, the same value
+  posted as `reservation`.
 - Book / join waitlist: `POST /booking/member/1.0/bookings/gym/` with `{"reservation": "<sfid>"}`
   → `{"status": "BOOKED", "heroku_id": "<ref>", "waitlist_position": N, ...}`
 - Cancel: `PATCH /booking/member/1.0/bookings/gym/<heroku_id>/cancel/`
@@ -208,6 +221,24 @@ the class filled between the listing and the POST. Treating it as a failure
 produces a misleading "❌ Failed to book" and leaves the class out of the dedup
 set, so the bot keeps retrying something it already joined.
 
+Only `status` says which one you got. **`waitlist_position` is not a signal**:
+the API returns `1` for confirmed and cancelled bookings as well, so inferring
+"waitlisted" from a non-zero position mislabels real bookings.
+
+### Waitlist promotions
+
+Nuffield appears to send no email when a waitlist place becomes a confirmed
+booking (none arrived for the join either). An unnoticed promotion means
+turning up to nothing, or worse, a no-show fee for a class you did not know you
+had. The bot therefore re-reads `GET /bookings/` every
+`BOOKING_CHECK_INTERVAL_SECONDS` and notifies on any status change:
+
+- `Waitlist → Booked` → "🎉 Off the waitlist"
+- anything held → not held (cancelled by you or the gym) → "⚠️ no longer held"
+
+The check is skipped entirely during the release burst so it never competes
+with a booking for rate-limit quota.
+
 ## Docker
 
 ```bash
@@ -219,6 +250,71 @@ The image bakes in Chromium (`playwright install --with-deps chromium` into
 `/ms-playwright`, world-readable so the unprivileged `botuser` can launch it) and
 the `tzdata` pip package, which `python:3.12-slim` lacks and `ZoneInfo` needs.
 Compose sets `shm_size: 512m`, without which Chromium crashes.
+
+## Running overnight on a Mac
+
+The bot has to be alive at 07:00, which on a laptop means two separate things:
+the container must be running, **and the machine must not sleep**. Docker
+Desktop suspends every container when macOS sleeps, so a sleeping Mac means no
+booking, silently.
+
+Check your current sleep setting:
+
+```bash
+pmset -g | grep '^ sleep'
+```
+
+Anything other than `0` means the Mac will sleep when idle and the bot will stop.
+
+### Keep it awake for one night
+
+`caffeinate` holds a power assertion for as long as it runs. Start it detached
+so it survives closing the terminal, and give it a deadline so it cannot keep
+the machine awake forever:
+
+```bash
+# 20 hours (72000s): covers an evening start through the 07:00 drop
+nohup caffeinate -s -t 72000 >/dev/null 2>&1 &
+```
+
+- `-s` prevents *system* sleep (the display may still sleep, which is fine)
+- `-t <seconds>` auto-expires, so you cannot forget about it
+- `nohup ... &` detaches it from the terminal session
+
+Confirm it is holding, then start the bot:
+
+```bash
+pgrep -lf 'caffeinate -s'          # shows the PID if it is running
+pmset -g | grep '^ sleep'          # should now list "caffeinate" as preventing sleep
+docker compose up -d
+```
+
+Stop it early when you no longer need it:
+
+```bash
+pkill -f 'caffeinate -s'
+```
+
+Note `-s` only guarantees no sleep **on AC power**. On battery, macOS may still
+sleep; plug the machine in. Check with `pmset -g batt`.
+
+### A permanent alternative
+
+If this machine is always meant to run the bot, disable idle sleep on AC
+instead of caffeinating nightly (needs sudo, and persists across reboots):
+
+```bash
+sudo pmset -c sleep 0              # 'c' = connected to charger
+sudo pmset -c sleep 1              # undo
+```
+
+Also consider enabling "Start Docker Desktop when you sign in" in Docker
+settings, otherwise a reboot leaves the bot down until you open Docker by hand.
+Check whether it is set:
+
+```bash
+osascript -e 'tell application "System Events" to get the name of every login item' | tr ',' '\n' | grep -i docker
+```
 
 ## Going live checklist
 

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from nuffield_bot.config import Settings
-from nuffield_bot.domain.models import ClassStatus
+from nuffield_bot.domain.models import BookingResult, ClassStatus
 from nuffield_bot.services.booking_service import BookingService
-from tests.fakes import FakeClock, FakeNotifier, FakeRepo, make_class
+from tests.fakes import (
+    FakeClock,
+    FakeNotifier,
+    FakeRepo,
+    make_booking,
+    make_class,
+)
 
 # 2026-10-13 is BST, so 06:00 UTC == 07:00 Europe/London (the default release time).
 BURST_NOW = datetime(2026, 10, 13, 6, 0, tzinfo=UTC)
@@ -218,6 +224,156 @@ async def test_gate_can_be_disabled():
     await svc._tick(is_burst=False)
 
     assert repo.book_calls == ["c1"]
+
+
+@pytest.mark.asyncio
+async def test_available_class_that_comes_back_waitlisted_is_reported_honestly():
+    """2026-10-15: the listing said available, the POST answered WAITLIST. We
+    must not claim '✅ Booked' for a waitlist place."""
+
+    class WaitlistingRepo(FakeRepo):
+        async def book(self, class_id):
+            self.book_calls.append(class_id)
+            return BookingResult(
+                success=True,
+                class_id=class_id,
+                waitlisted=True,
+                message="WAITLIST #1 (ref r)",
+            )
+
+    notifier = FakeNotifier()
+    svc = BookingService(
+        WaitlistingRepo([make_class(status=ClassStatus.AVAILABLE)]),
+        notifier,
+        FakeClock(BURST_NOW),
+        Settings(dry_run=False),
+    )
+
+    await svc._tick(is_burst=True)
+
+    assert "waitlist" in notifier.messages[0].casefold()
+    assert "✅" not in notifier.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_repeated_booking_failure_notifies_once_but_keeps_trying():
+    repo = FakeRepo([make_class()], succeed=False)
+    notifier = FakeNotifier()
+    svc = build(repo, notifier, FakeClock(BURST_NOW))
+
+    for _ in range(5):
+        await svc._tick(is_burst=True)
+
+    # Still retrying the booking...
+    assert len(repo.book_calls) == 5
+    # ...but the user is not messaged five times.
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0].startswith("❌")
+
+
+@pytest.mark.asyncio
+async def test_preflight_seeds_dedup_from_places_already_held():
+    """A restart must not re-book a class we are already on."""
+    repo = FakeRepo([make_class()], held={"c1"})
+    notifier = FakeNotifier()
+    svc = build(repo, notifier, FakeClock(BURST_NOW))
+
+    await svc._preflight()
+    await svc._tick(is_burst=True)
+
+    assert repo.book_calls == []
+    assert "1 already held" in notifier.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_preflight_survives_a_failed_held_lookup():
+    class BrokenHeld(FakeRepo):
+        async def find_held_class_ids(self):
+            raise RuntimeError("500")
+
+    repo = BrokenHeld([make_class()])
+    svc = build(repo, FakeNotifier(), FakeClock(BURST_NOW))
+
+    await svc._preflight()
+    await svc._tick(is_burst=True)
+
+    # Degrades to the old behaviour rather than refusing to run.
+    assert repo.book_calls == ["c1"]
+
+
+def _promo_svc(repo, notifier, clock):
+    return BookingService(repo, notifier, clock, Settings(dry_run=False))
+
+
+@pytest.mark.asyncio
+async def test_waitlist_promotion_is_announced():
+    """Nuffield sends no email when a waitlist place becomes a booking, so an
+    unnoticed promotion can turn into a no-show fee."""
+    repo = FakeRepo(bookings=[make_booking("c1", status="Waitlist")])
+    notifier = FakeNotifier()
+    clock = FakeClock(OFF_PEAK_NOW)
+    svc = _promo_svc(repo, notifier, clock)
+
+    await svc._preflight()
+    notifier.messages.clear()
+
+    repo.bookings = [make_booking("c1", status="Booked")]
+    clock.set_now(OFF_PEAK_NOW + timedelta(hours=1))
+    await svc._check_promotions(clock.now())
+
+    assert len(notifier.messages) == 1
+    assert "Off the waitlist" in notifier.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_promotion_is_announced_once_not_every_poll():
+    repo = FakeRepo(bookings=[make_booking("c1", status="Waitlist")])
+    notifier = FakeNotifier()
+    clock = FakeClock(OFF_PEAK_NOW)
+    svc = _promo_svc(repo, notifier, clock)
+    await svc._preflight()
+    notifier.messages.clear()
+
+    repo.bookings = [make_booking("c1", status="Booked")]
+    for hour in range(1, 4):
+        clock.set_now(OFF_PEAK_NOW + timedelta(hours=hour))
+        await svc._check_promotions(clock.now())
+
+    assert len(notifier.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_losing_a_place_is_announced():
+    repo = FakeRepo(bookings=[make_booking("c1", status="Booked")])
+    notifier = FakeNotifier()
+    clock = FakeClock(OFF_PEAK_NOW)
+    svc = _promo_svc(repo, notifier, clock)
+    await svc._preflight()
+    notifier.messages.clear()
+
+    repo.bookings = [make_booking("c1", status="Class Cancelled", held=False)]
+    clock.set_now(OFF_PEAK_NOW + timedelta(hours=1))
+    await svc._check_promotions(clock.now())
+
+    assert "no longer held" in notifier.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_promotion_check_is_rate_limited_and_skips_the_burst():
+    repo = FakeRepo(bookings=[make_booking("c1", status="Waitlist")])
+    clock = FakeClock(OFF_PEAK_NOW)
+    svc = _promo_svc(repo, FakeNotifier(), clock)
+    await svc._preflight()
+    before = len(repo.booking_lookups)
+
+    # Too soon after the last check.
+    await svc._check_promotions(clock.now())
+    assert len(repo.booking_lookups) == before
+
+    # Due, but inside the release burst: the booking race takes priority.
+    clock.set_now(BURST_NOW)
+    await svc._check_promotions(clock.now())
+    assert len(repo.booking_lookups) == before
 
 
 def test_burst_window_detection():
