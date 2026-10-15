@@ -1,7 +1,7 @@
 # nuffield-bot
 
-A small asyncio bot that books **Reformer Pilates** at Nuffield Health Baltimore
-Wharf the moment bookings open (8 days ahead, 07:00 UK time). It polls the member
+A small asyncio bot that books **any classes** at Nuffield Health gyms
+the moment bookings open (8 days ahead, 07:00 UK time). It polls the member
 booking API, grabs a matching lunchtime slot as soon as it goes live, optionally
 joins the waitlist if the class is already full, and notifies you over WhatsApp.
 
