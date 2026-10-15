@@ -8,6 +8,7 @@ from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 import httpx
+import structlog
 from tenacity import (
     retry,
     retry_if_exception,
@@ -24,6 +25,8 @@ from nuffield_bot.domain.models import (
 )
 from nuffield_bot.domain.ports import TokenProvider
 
+logger = structlog.get_logger()
+
 API_BASE = "https://api.nuffieldhealth.com/booking"
 BOOKABLE_ITEMS_URL = f"{API_BASE}/member/1.0/bookable_items/gym/"
 BOOK_URL = f"{API_BASE}/member/1.0/bookings/gym/"
@@ -31,6 +34,10 @@ MY_BOOKINGS_URL = f"{API_BASE}/member/1.0/bookings/"
 # my_booking.status values that mean we still hold a place. Cancelled bookings
 # stay in the upcoming list, and must not block re-booking the same class.
 HELD_STATUSES = frozenset({"booked", "waitlist"})
+# An expired token comes back as 403 "Invalid Auth Token or Missing Claim(s)",
+# never 401, so re-authenticating only on 401 would never fire. Verified
+# against the live API with expired, truncated and garbage tokens.
+AUTH_REJECTED_STATUSES = frozenset({401, 403})
 MAX_BOOKING_PAGES = 10
 # Keep retrying a throttled booking for this long. Spots went from 7 free to
 # full in ~30s at the last release, so a slow win still beats giving up.
@@ -110,11 +117,17 @@ class HttpClassRepository:
         }
 
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Send an authenticated request, re-authenticating once on 401."""
+        """Send an authenticated request, re-authenticating once if the token
+        is rejected."""
         headers = {**self._base_headers(), **kwargs.pop("headers", {})}
         headers["Authorization"] = f"Bearer {await self._tokens.get_token()}"
         response = await self._client.request(method, url, headers=headers, **kwargs)
-        if response.status_code == 401:
+        if response.status_code in AUTH_REJECTED_STATUSES:
+            logger.warning(
+                "auth.rejected_reauthenticating",
+                status=response.status_code,
+                detail=response.text[:120],
+            )
             token = await self._tokens.get_token(force_refresh=True)
             headers["Authorization"] = f"Bearer {token}"
             response = await self._client.request(

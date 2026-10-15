@@ -279,6 +279,43 @@ async def test_key_learned_from_login_overrides_configured_key():
     assert seen["ocp-apim-subscription-key"] == "learned-key"
 
 
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.asyncio
+async def test_rejected_token_triggers_one_reauth_then_succeeds(status):
+    """The live API answers 403 "Invalid Auth Token or Missing Claim(s)" for an
+    expired token, never 401. Re-authenticating only on 401 meant a stale token
+    failed every tick until the background keeper happened to refresh it."""
+    calls = {"n": 0}
+
+    class CountingProvider:
+        def __init__(self) -> None:
+            self.logins = 0
+
+        async def get_token(self, force_refresh: bool = False) -> str:
+            if force_refresh:
+                self.logins += 1
+                return "fresh"
+            return "stale"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if request.headers["Authorization"] == "Bearer stale":
+            return httpx.Response(
+                status, text='{"message": "Invalid Auth Token or Missing Claim(s)"}'
+            )
+        return httpx.Response(200, json={"items": []})
+
+    tokens = CountingProvider()
+    repo, client = _repo(handler, tokens=tokens)
+    try:
+        await repo.find_upcoming("loc", ["Reformer"], 8)
+    finally:
+        await client.aclose()
+
+    assert tokens.logins == 1
+    assert calls["n"] == 2
+
+
 @pytest.mark.asyncio
 async def test_401_is_not_retried_into_a_login_storm():
     calls = {"n": 0}
