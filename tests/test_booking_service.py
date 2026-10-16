@@ -376,6 +376,19 @@ async def test_promotion_check_is_rate_limited_and_skips_the_burst():
     assert len(repo.booking_lookups) == before
 
 
+def test_burst_does_not_start_long_before_the_drop():
+    """2026-10-16: bursting 45s early spent the rate-limit quota on a day the
+    API had not published yet, and the 429s began 26s before the release."""
+    svc = build(FakeRepo(), FakeNotifier(), FakeClock(BURST_NOW))
+    release = BURST_NOW  # 07:00 London
+
+    assert svc._is_burst_window(release - timedelta(seconds=30)) is False
+    assert svc._is_burst_window(release - timedelta(seconds=3)) is True
+    assert svc._is_burst_window(release) is True
+    assert svc._is_burst_window(release + timedelta(seconds=40)) is True
+    assert svc._is_burst_window(release + timedelta(seconds=60)) is False
+
+
 def test_burst_window_detection():
     svc = build(FakeRepo(), FakeNotifier(), FakeClock(BURST_NOW))
     assert svc._is_burst_window(BURST_NOW) is True

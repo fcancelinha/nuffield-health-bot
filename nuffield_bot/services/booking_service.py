@@ -275,6 +275,13 @@ class BookingService:
             )
 
     def _is_burst_window(self, now: datetime) -> bool:
+        """Asymmetric on purpose: a short lead for clock skew, then the full
+        window after the drop. Bursting long before the release only burns
+        rate-limit quota on a day the API has not published yet."""
         local = now.astimezone(self._tz)
-        delta = abs((local - self._release_on(local)).total_seconds())
-        return delta <= self._settings.burst_window_seconds
+        since_release = (local - self._release_on(local)).total_seconds()
+        return (
+            -self._settings.burst_lead_seconds
+            <= since_release
+            <= self._settings.burst_window_seconds
+        )

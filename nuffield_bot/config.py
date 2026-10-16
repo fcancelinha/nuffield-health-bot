@@ -95,6 +95,11 @@ class Settings(BaseSettings):
     burst_interval_seconds: float = 1.0
     burst_jitter_seconds: float = 0.2
     burst_window_seconds: int = 45
+    # How early to start bursting. The target day does not exist in the API
+    # until the release, so polling hard beforehand spends rate-limit quota on
+    # guaranteed-empty responses: on 2026-10-16 the 429s began 26s *before* the
+    # drop. A few seconds of lead covers clock skew, nothing more.
+    burst_lead_seconds: float = 5.0
 
     # When bookings open (local to the configured timezone)
     release_hour: int = 7
