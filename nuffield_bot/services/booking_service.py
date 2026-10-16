@@ -9,8 +9,10 @@ import structlog
 from nuffield_bot.config import Settings
 from nuffield_bot.domain.models import ClassStatus, GymClass, HeldBooking
 from nuffield_bot.domain.ports import ClassRepository, Clock, Notifier
+from nuffield_bot.services.ledger import BookingLedger
 
 HEARTBEAT_INTERVAL = timedelta(minutes=15)
+WHEN_FORMAT = "%a %d %b %H:%M %Z"
 
 
 class BookingService:
@@ -27,17 +29,24 @@ class BookingService:
         self._clock = clock
         self._settings = settings
         self._tz = ZoneInfo(settings.timezone)
-        self._booked: set[str] = set()
-        self._held: set[str] = set()
-        self._failed: set[str] = set()
+        self._ledger = BookingLedger()
         self._log = logger or structlog.get_logger()
         self._arm_at = self._next_release_after(clock.now())
         self._last_beat = clock.now() - HEARTBEAT_INTERVAL
-        self._known_status: dict[str, str] = {}
         self._booking_check_interval = timedelta(
             seconds=settings.booking_check_interval_seconds
         )
         self._last_booking_check = clock.now()
+
+    def _when(self, moment: datetime) -> str:
+        return format(moment.astimezone(self._tz), WHEN_FORMAT)
+
+    async def _find_candidates(self) -> list[GymClass]:
+        return await self._repo.find_upcoming(
+            location_id=self._settings.location_id,
+            name_filters=self._settings.class_name_filters,
+            days_ahead=self._settings.target_days_ahead,
+        )
 
     async def run_forever(self) -> None:
         self._log.info(
@@ -68,18 +77,14 @@ class BookingService:
             now=local.isoformat(timespec="seconds"),
             armed=self._is_armed(now),
             mins_to_arm=max(0, round((self._arm_at - local).total_seconds() / 60)),
-            booked=len(self._booked),
+            booked=len(self._ledger),
         )
 
     async def _preflight(self) -> None:
         """Exercise auth and the listing call once at boot so a broken token is
         reported immediately rather than discovered at release time."""
         try:
-            classes = await self._repo.find_upcoming(
-                location_id=self._settings.location_id,
-                name_filters=self._settings.class_name_filters,
-                days_ahead=self._settings.target_days_ahead,
-            )
+            classes = await self._find_candidates()
         except Exception as exc:
             self._log.exception("preflight.failed")
             await self._notifier.notify(f"⚠️ Startup check failed: {exc!r}")
@@ -104,12 +109,10 @@ class BookingService:
         bookings = await self._fetch_bookings()
         if bookings is None:
             return 0
-        held = {b.class_id for b in bookings if b.held}
-        self._booked |= held
-        self._known_status = {b.class_id: b.status for b in bookings if b.held}
+        held = self._ledger.adopt(bookings)
         if held:
-            self._log.info("preflight.seeded_booked", count=len(held))
-        return len(held)
+            self._log.info("preflight.seeded_booked", count=held)
+        return held
 
     async def _fetch_bookings(self) -> list[HeldBooking] | None:
         try:
@@ -133,10 +136,10 @@ class BookingService:
             return
 
         for booking in bookings:
-            previous = self._known_status.get(booking.class_id)
+            previous = self._ledger.status_of(booking.class_id)
             if previous is None or previous == booking.status:
                 continue
-            when = booking.start.astimezone(self._tz)
+            when = self._when(booking.start)
             self._log.info(
                 "booking.status_changed",
                 class_id=booking.class_id,
@@ -145,17 +148,15 @@ class BookingService:
             )
             if booking.held and previous.casefold() == "waitlist":
                 await self._notifier.notify(
-                    f"🎉 Off the waitlist: {booking.name} on "
-                    f"{when:%a %d %b %H:%M %Z} is now {booking.status}. "
-                    f"Turn up or cancel to avoid a no-show."
+                    f"🎉 Off the waitlist: {booking.name} on {when} is now "
+                    f"{booking.status}. Turn up or cancel to avoid a no-show."
                 )
             elif not booking.held:
                 await self._notifier.notify(
-                    f"⚠️ {booking.name} on {when:%a %d %b %H:%M %Z} is no longer "
-                    f"held (now {booking.status})."
+                    f"⚠️ {booking.name} on {when} is no longer held "
+                    f"(now {booking.status})."
                 )
-        # Track everything we saw, so a place lost then regained still reports.
-        self._known_status = {b.class_id: b.status for b in bookings if b.held}
+        self._ledger.remember_statuses(bookings)
 
     def _next_interval(self, is_burst: bool) -> float:
         if not is_burst:
@@ -164,42 +165,33 @@ class BookingService:
         return self._settings.burst_interval_seconds + jitter
 
     async def _tick(self, is_burst: bool) -> None:
-        classes = await self._repo.find_upcoming(
-            location_id=self._settings.location_id,
-            name_filters=self._settings.class_name_filters,
-            days_ahead=self._settings.target_days_ahead,
-        )
+        classes = await self._find_candidates()
         armed = self._is_armed(self._clock.now())
 
         for cls in classes:
-            if cls.id in self._booked:
+            if self._ledger.is_secured(cls.id) or not self._matches_schedule(cls):
                 continue
-            if not self._in_time_window(cls):
-                continue
-            open_now = cls.status == ClassStatus.AVAILABLE and cls.spots_left > 0
-            joinable = (
-                self._settings.join_waitlist and cls.status == ClassStatus.WAITLIST
-            )
-            wants = open_now or joinable
-            if wants and not armed:
-                # Once per class, not once per 5s poll all night.
-                if cls.id not in self._held:
-                    self._held.add(cls.id)
-                    self._log.info(
-                        "slot.held_until_release",
-                        class_id=cls.id,
-                        name=cls.name,
-                        status=cls.status.value,
-                        arms_at=self._arm_at.isoformat(),
+            if not self._is_takeable(cls):
+                if is_burst:
+                    self._log.debug(
+                        "burst.poll", class_id=cls.id, status=cls.status.value
                     )
-            elif wants:
+                continue
+            if armed:
                 await self._try_book(cls)
-            elif is_burst:
-                self._log.debug(
-                    "burst.poll",
+            elif self._ledger.should_report_hold(cls.id):
+                self._log.info(
+                    "slot.held_until_release",
                     class_id=cls.id,
+                    name=cls.name,
                     status=cls.status.value,
+                    arms_at=self._arm_at.isoformat(),
                 )
+
+    def _is_takeable(self, cls: GymClass) -> bool:
+        if cls.status == ClassStatus.AVAILABLE and cls.spots_left > 0:
+            return True
+        return self._settings.join_waitlist and cls.status == ClassStatus.WAITLIST
 
     def _release_on(self, day: datetime) -> datetime:
         return day.replace(
@@ -227,18 +219,19 @@ class BookingService:
             return True
         return now.astimezone(self._tz) >= self._arm_at
 
-    def _in_time_window(self, cls: GymClass) -> bool:
-        local_time = cls.start.astimezone(self._tz).time()
+    def _matches_schedule(self, cls: GymClass) -> bool:
+        """Judged in the gym's timezone, not the container's."""
+        local = cls.start.astimezone(self._tz)
         return (
             self._settings.class_time_from
-            <= local_time
+            <= local.time()
             <= self._settings.class_time_to
         )
 
     async def _try_book(self, cls: GymClass) -> None:
         is_waitlist = cls.status == ClassStatus.WAITLIST
         verb = "join waitlist for" if is_waitlist else "book"
-        when = cls.start.astimezone(self._tz)
+        when = self._when(cls.start)
         self._log.info(
             "slot.found",
             class_id=cls.id,
@@ -247,29 +240,29 @@ class BookingService:
             waitlist=is_waitlist,
         )
         if self._settings.dry_run:
-            self._booked.add(cls.id)
-            await self._notifier.notify(
-                f"🟡 (dry run) Would {verb} {cls.name} at {when:%a %d %b %H:%M %Z}"
-            )
+            self._ledger.record_secured(cls.id)
             self._log.info("booking.dry_run", class_id=cls.id, waitlist=is_waitlist)
+            await self._notifier.notify(
+                f"🟡 (dry run) Would {verb} {cls.name} at {when}"
+            )
             return
+
         result = await self._repo.book(cls.id)
         if result.success:
-            self._booked.add(cls.id)
-            self._failed.discard(cls.id)
+            self._ledger.record_secured(cls.id)
+            self._log.info("booking.success", **result.model_dump())
             # Trust the response, not the listing: a class that looked open can
             # still come back WAITLIST if it filled before the POST landed.
             prefix = "📋 Joined waitlist for" if result.waitlisted else "✅ Booked"
             await self._notifier.notify(
-                f"{prefix} {cls.name} at {when:%a %d %b %H:%M %Z} ({result.message})"
+                f"{prefix} {cls.name} at {when} ({result.message})"
             )
-            self._log.info("booking.success", **result.model_dump())
             return
+
         self._log.warning("booking.failed", class_id=cls.id, message=result.message)
-        # Keep retrying, but only notify the first time: the loop revisits a
-        # failing class every poll and would otherwise send a message a second.
-        if cls.id not in self._failed:
-            self._failed.add(cls.id)
+        # Keep retrying, but report only the first failure: the loop revisits a
+        # failing class every poll and would otherwise message every second.
+        if self._ledger.should_report_failure(cls.id):
             await self._notifier.notify(
                 f"❌ Failed to {verb} {cls.name}: {result.message}"
             )
