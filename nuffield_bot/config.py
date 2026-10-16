@@ -4,6 +4,59 @@ from typing import Annotated
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+_DAY_NAMES = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+# Shorthands for the specs people actually want to type.
+_DAY_ALIASES = {
+    "weekdays": "mon-fri",
+    "weekends": "sat,sun",
+    "everyday": "mon-sun",
+    "daily": "mon-sun",
+    "all": "mon-sun",
+}
+
+
+def _day_number(token: str) -> int:
+    key = token.strip().casefold()
+    for index, name in enumerate(_DAY_NAMES):
+        if key in (name, name[:3]):
+            return index
+    raise ValueError(
+        f"Unknown day {token!r}. Use names like 'Mon' or 'Monday', "
+        f"ranges like 'Mon-Fri', or 'weekdays'/'weekends'."
+    )
+
+
+def parse_weekdays(spec: str) -> frozenset[int]:
+    """Parse a day spec into Python weekday numbers (Monday=0).
+
+    Accepts comma-separated names, inclusive ranges, and aliases:
+    `Mon,Wed,Fri` / `Mon-Fri` / `weekdays` / `Sat-Sun`. Ranges may wrap
+    (`Fri-Mon`). Unknown names raise rather than silently matching nothing,
+    which would leave the bot quietly never booking.
+    """
+    days: set[int] = set()
+    for raw in _DAY_ALIASES.get(spec.strip().casefold(), spec).split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start, end = (_day_number(part) for part in token.split("-", 1))
+            span = (end - start) % 7
+            days.update((start + step) % 7 for step in range(span + 1))
+        else:
+            days.add(_day_number(token))
+    if not days:
+        raise ValueError("No days selected; the bot would never book anything.")
+    return frozenset(days)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -86,6 +139,19 @@ class Settings(BaseSettings):
     # Only book classes starting within this window (local to the configured timezone)
     class_time_from: time = time(11, 0)
     class_time_to: time = time(14, 0)
+    # Which days a class may fall on. Baltimore Wharf runs no evening Reformer
+    # at weekends, so an evening window only ever matches Mon-Fri.
+    class_days: str = "Mon-Fri"
+
+    @field_validator("class_days")
+    @classmethod
+    def _validate_days(cls, value: str) -> str:
+        parse_weekdays(value)  # fail at startup, not silently at 07:00
+        return value
+
+    @property
+    def class_weekdays(self) -> frozenset[int]:
+        return parse_weekdays(self.class_days)
 
     # Polling cadence
     poll_interval_seconds: float = 5.0

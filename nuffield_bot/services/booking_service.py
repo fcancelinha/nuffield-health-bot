@@ -220,8 +220,11 @@ class BookingService:
         return now.astimezone(self._tz) >= self._arm_at
 
     def _matches_schedule(self, cls: GymClass) -> bool:
-        """Judged in the gym's timezone, not the container's."""
+        """Does the class fall on a wanted day, at a wanted time? Both are
+        judged in the gym's timezone, not the container's."""
         local = cls.start.astimezone(self._tz)
+        if local.weekday() not in self._settings.class_weekdays:
+            return False
         return (
             self._settings.class_time_from
             <= local.time()
