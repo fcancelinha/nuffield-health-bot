@@ -14,7 +14,6 @@ from tenacity import (
     retry_if_exception,
     stop_after_attempt,
     stop_after_delay,
-    wait_exponential,
 )
 
 from nuffield_bot.domain.models import (
@@ -138,7 +137,7 @@ class HttpClassRepository:
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.4),
+        wait=_wait_for_retry_after,
         retry=retry_if_exception(_is_transient),
         reraise=True,
     )
@@ -169,7 +168,7 @@ class HttpClassRepository:
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.4),
+        wait=_wait_for_retry_after,
         retry=retry_if_exception(_is_transient),
         reraise=True,
     )
