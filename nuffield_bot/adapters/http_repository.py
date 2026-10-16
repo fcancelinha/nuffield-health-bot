@@ -91,13 +91,18 @@ class HttpClassRepository:
         self._origin = origin
         self._tz = ZoneInfo(timezone)
 
-    def _day_bounds(self, days_ahead: int) -> tuple[datetime, datetime]:
+    def _day_bounds(
+        self, days_ahead: int, now: datetime | None = None
+    ) -> tuple[datetime, datetime]:
         """Midnight-to-midnight for the target day **in the gym's timezone**,
         expressed in UTC for the wire. Deriving the day in UTC would shift the
-        window by an hour during BST and drop classes either side of midnight.
-        Dates are stepped by calendar day, not 24h, so DST changeovers are safe.
+        window by an hour during BST and, between local midnight and 01:00,
+        pick the wrong calendar day entirely. Dates are stepped by calendar
+        day, not 24h, so DST changeovers are safe. `now` is injectable so that
+        last part is testable.
         """
-        target = (datetime.now(self._tz) + timedelta(days=days_ahead)).date()
+        moment = (now or datetime.now(UTC)).astimezone(self._tz)
+        target = (moment + timedelta(days=days_ahead)).date()
         start = datetime.combine(target, dtime.min, tzinfo=self._tz)
         end = datetime.combine(target + timedelta(days=1), dtime.min, tzinfo=self._tz)
         return start.astimezone(UTC), (end - timedelta(milliseconds=1)).astimezone(UTC)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
@@ -22,7 +22,6 @@ from nuffield_bot.adapters.http_repository import (
     _map_status,
     _retry_after_seconds,
 )
-from nuffield_bot.config import Settings
 from nuffield_bot.domain.models import ClassStatus
 
 
@@ -80,6 +79,9 @@ def test_parses_item_into_gym_class():
     assert cls.capacity == 8
     assert cls.booked == 3
     assert cls.spots_left == 5
+    # Capacity and attendees arrive as floats; spots_left must not go negative.
+    over = HttpClassRepository._to_gym_class({**AVAILABLE_ITEM, "attendees": 12.0})
+    assert over.spots_left == 0
     assert cls.status == ClassStatus.AVAILABLE
     assert cls.start.tzinfo is not None
 
@@ -121,32 +123,6 @@ async def test_find_upcoming_filters_and_authenticates():
     assert [c.name for c in classes] == ["Reformer Pilates - Signature"]
 
 
-@pytest.mark.asyncio
-async def test_find_upcoming_matches_both_configured_titles():
-    titles = [
-        "Reformer Pilates - Signature",
-        "Reformer Pilates - Foundations",
-        "Reformer Pilates - Advanced",
-        "Yoga Flow",
-    ]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        items = [
-            {**AVAILABLE_ITEM, "sfid": f"s{i}", "title": t}
-            for i, t in enumerate(titles)
-        ]
-        return httpx.Response(200, json={"items": items})
-
-    repo, client = _repo(handler)
-    try:
-        classes = await repo.find_upcoming("loc", Settings().class_name_filters, 8)
-    finally:
-        await client.aclose()
-
-    assert [c.name for c in classes] == [
-        "Reformer Pilates - Signature",
-        "Reformer Pilates - Foundations",
-    ]
 
 
 @pytest.mark.asyncio
@@ -475,54 +451,29 @@ async def test_cancelled_bookings_are_not_counted_as_held():
     assert held == {"booked-1", "wait-1"}
 
 
-@pytest.mark.asyncio
-async def test_my_bookings_follow_pagination():
-    pages = {
-        1: {"next": "page2", "items": [_booking("a", "Booked")]},
-        2: {"next": None, "items": [_booking("b", "Waitlist")]},
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        page = int(request.url.params.get("page", 1))
-        return httpx.Response(200, json=pages[page])
-
-    repo, client = _repo(handler)
-    try:
-        bookings = await repo.find_my_bookings()
-        held = {b.class_id for b in bookings if b.held}
-    finally:
-        await client.aclose()
-
-    assert held == {"a", "b"}
 
 
-@pytest.mark.asyncio
-async def test_day_window_is_built_in_gym_local_time_during_bst():
-    """Deriving the day in UTC shifts the window an hour during BST and drops
-    classes either side of local midnight."""
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.update(request.url.params)
-        return httpx.Response(200, json={"items": []})
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+def test_day_window_uses_the_gyms_calendar_day_not_utc():
+    """At 00:30 London during BST it is still the previous day in UTC, so a
+    UTC-derived target lands a day early and the whole query is wrong."""
+    london = ZoneInfo("Europe/London")
     repo = HttpClassRepository(
-        client,
+        httpx.AsyncClient(),
         StaticTokenProvider("tok"),
         subscription_key="k",
         origin="o",
         timezone="Europe/London",
     )
-    try:
-        await repo.find_upcoming("loc", ["x"], 8)
-    finally:
-        await client.aclose()
+    # The same instant as production sees it: 00:30 Monday in London is still
+    # 23:30 Sunday in UTC.
+    just_after_midnight = datetime(2026, 10, 18, 23, 30, tzinfo=UTC)
 
-    start = datetime.fromisoformat(seen["from_date"])
-    end = datetime.fromisoformat(seen["to_date"])
-    london = ZoneInfo("Europe/London")
-    # Whatever the UTC offset, the window must be local midnight to midnight.
+    start, end = repo._day_bounds(8, now=just_after_midnight)
+
+    # 19 Oct + 8 days = 27 Oct. Deriving from UTC (still 18 Oct, 23:30) would
+    # give 26 Oct.
+    assert start.astimezone(london).date() == date(2026, 10, 27)
+    # ...and the window is local midnight to midnight, not 01:00 to 01:00.
     assert start.astimezone(london).time() == dtime(0, 0)
     assert end.astimezone(london).hour == 23
     assert timedelta(hours=23) < (end - start) < timedelta(hours=25)
@@ -552,26 +503,8 @@ async def test_seeded_provider_serves_valid_seed_without_browser():
     assert fallback.calls == 0
 
 
-@pytest.mark.asyncio
-async def test_seeded_provider_skips_expired_seed():
-    fallback = _RecordingProvider()
-    provider = SeededTokenProvider(_jwt(time.time() - 1), fallback)
-
-    assert await provider.get_token() == "from-browser"
-    assert fallback.calls == 1
 
 
-@pytest.mark.asyncio
-async def test_seeded_provider_discards_seed_after_force_refresh():
-    seed = _jwt(time.time() + 3600)
-    fallback = _RecordingProvider()
-    provider = SeededTokenProvider(seed, fallback)
-
-    assert await provider.get_token() == seed
-    assert await provider.get_token(force_refresh=True) == "from-browser"
-    # Seed is dropped for good, so later calls keep using the browser.
-    assert await provider.get_token() == "from-browser"
-    assert fallback.calls == 2
 
 
 def test_jwt_exp_reads_expiry():

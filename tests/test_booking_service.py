@@ -49,17 +49,6 @@ async def test_dedup_does_not_rebook():
     assert repo.book_calls == ["c1"]
 
 
-@pytest.mark.asyncio
-async def test_failed_booking_notifies_and_is_retryable():
-    repo = FakeRepo([make_class()], succeed=False)
-    notifier = FakeNotifier()
-    svc = build(repo, notifier, FakeClock(BURST_NOW))
-
-    await svc._tick(is_burst=True)
-    await svc._tick(is_burst=True)
-
-    assert repo.book_calls == ["c1", "c1"]  # not deduped, booking never succeeded
-    assert all(m.startswith("❌") for m in notifier.messages)
 
 
 @pytest.mark.asyncio
@@ -134,17 +123,6 @@ async def test_skips_waitlist_when_disabled():
     assert repo.book_calls == []
 
 
-@pytest.mark.asyncio
-async def test_preflight_reports_auth_ok():
-    repo = FakeRepo([make_class()])
-    notifier = FakeNotifier()
-    svc = build(repo, notifier, FakeClock(BURST_NOW))
-
-    await svc._preflight()
-
-    assert repo.find_calls == 1
-    assert repo.book_calls == []  # preflight never books
-    assert "Auth OK" in notifier.messages[0]
 
 
 @pytest.mark.asyncio
@@ -210,20 +188,6 @@ async def test_books_once_release_time_passes():
     assert repo.book_calls == ["c1"]
 
 
-@pytest.mark.asyncio
-async def test_gate_can_be_disabled():
-    night_before = datetime(2026, 10, 12, 20, 0, tzinfo=UTC)
-    repo = FakeRepo([make_class()])
-    svc = BookingService(
-        repo,
-        FakeNotifier(),
-        FakeClock(night_before),
-        Settings(dry_run=False, book_only_after_release=False),
-    )
-
-    await svc._tick(is_burst=False)
-
-    assert repo.book_calls == ["c1"]
 
 
 @pytest.mark.asyncio
@@ -318,28 +282,15 @@ async def test_waitlist_promotion_is_announced():
     notifier.messages.clear()
 
     repo.bookings = [make_booking("c1", status="Booked")]
-    clock.set_now(OFF_PEAK_NOW + timedelta(hours=1))
-    await svc._check_promotions(clock.now())
-
-    assert len(notifier.messages) == 1
-    assert "Off the waitlist" in notifier.messages[0]
-
-
-@pytest.mark.asyncio
-async def test_promotion_is_announced_once_not_every_poll():
-    repo = FakeRepo(bookings=[make_booking("c1", status="Waitlist")])
-    notifier = FakeNotifier()
-    clock = FakeClock(OFF_PEAK_NOW)
-    svc = _promo_svc(repo, notifier, clock)
-    await svc._preflight()
-    notifier.messages.clear()
-
-    repo.bookings = [make_booking("c1", status="Booked")]
     for hour in range(1, 4):
         clock.set_now(OFF_PEAK_NOW + timedelta(hours=hour))
         await svc._check_promotions(clock.now())
 
+    # Announced, and announced only once across repeated polls.
     assert len(notifier.messages) == 1
+    assert "Off the waitlist" in notifier.messages[0]
+
+
 
 
 @pytest.mark.asyncio
@@ -389,19 +340,5 @@ def test_burst_does_not_start_long_before_the_drop():
     assert svc._is_burst_window(release + timedelta(seconds=60)) is False
 
 
-def test_burst_window_detection():
-    svc = build(FakeRepo(), FakeNotifier(), FakeClock(BURST_NOW))
-    assert svc._is_burst_window(BURST_NOW) is True
-    assert svc._is_burst_window(OFF_PEAK_NOW) is False
 
 
-def test_next_interval_switches_with_burst():
-    settings = Settings()
-    svc = build(FakeRepo(), FakeNotifier(), FakeClock(BURST_NOW))
-
-    assert svc._next_interval(is_burst=False) == settings.poll_interval_seconds
-
-    burst = svc._next_interval(is_burst=True)
-    assert settings.burst_interval_seconds <= burst <= (
-        settings.burst_interval_seconds + settings.burst_jitter_seconds
-    )

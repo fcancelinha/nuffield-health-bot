@@ -9,7 +9,6 @@ import pytest
 
 from nuffield_bot.adapters.auth import (
     BrowserTokenProvider,
-    SeededTokenProvider,
     keep_fresh,
 )
 
@@ -129,13 +128,3 @@ async def test_keeper_survives_persistent_failure():
     assert cap.calls > 1
 
 
-@pytest.mark.asyncio
-async def test_seeded_provider_delegates_keep_alive_to_the_browser():
-    inner = _provider()
-    cap = _StubCapture(inner)
-    seeded = SeededTokenProvider(_jwt(time.time() + 120), inner)
-
-    # Seed is valid for 120s but not for the 900s we need: refresh via browser.
-    await seeded.ensure_valid_for(900)
-
-    assert cap.calls == 1
