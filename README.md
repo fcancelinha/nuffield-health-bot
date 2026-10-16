@@ -2,7 +2,7 @@
 
 A small asyncio bot that books **any classes** at Nuffield Health gyms
 the moment bookings open (8 days ahead, 07:00 UK time). It polls the member
-booking API, grabs a matching lunchtime slot as soon as it goes live, optionally
+booking API, grabs a matching slot as soon as it goes live, optionally
 joins the waitlist if the class is already full, and notifies you over WhatsApp.
 
 > Personal-use automation for your own membership. Check Nuffield's website terms
@@ -11,10 +11,14 @@ joins the waitlist if the class is already full, and notifies you over WhatsApp.
 ## How it works
 
 - Every tick it queries the bookable classes for the target day and keeps the ones
-  whose title matches any entry in `CLASS_NAME_FILTERS` and that start inside your
-  time window.
-- Around the daily release time it enters a **burst**: it polls much faster (with
-  a little jitter) so it reacts within a fraction of a second when a slot appears.
+  whose title matches any entry in `CLASS_NAME_FILTERS`, that fall on a day in
+  `CLASS_DAYS`, and that start inside your time window.
+- Around the daily release it enters a **burst**, polling every
+  `BURST_INTERVAL_SECONDS` (with jitter) instead of the usual
+  `POLL_INTERVAL_SECONDS`. The burst is asymmetric: a few seconds of lead for
+  clock skew, then the full window afterwards. See
+  [rate limiting](#rate-limiting-polling-competes-with-booking) for why it is
+  not faster than that.
 - When a matching class is `AVAILABLE` it books it. If it's full and
   `JOIN_WAITLIST` is on, it joins the waitlist instead.
 - `BOOK_ONLY_AFTER_RELEASE` (default **true**) holds all booking until the first
@@ -40,13 +44,14 @@ __main__            entrypoint, logging, signal handling, graceful shutdown
 composition         wires settings + adapters into the service
 config              pydantic-settings loaded from env / .env
 domain/
-  models            GymClass, BookingResult, ClassStatus
+  models            GymClass, BookingResult, HeldBooking, ClassStatus
   ports             ClassRepository, Notifier, TokenProvider, Clock protocols
 services/
-  booking_service   polling loop, burst window, release gate, time filter,
-                    dedup, waitlist, preflight, heartbeat
+  booking_service   polling loop, burst window, release gate, schedule filter,
+                    waitlist, promotion watch, preflight, heartbeat
+  ledger            what has already been booked / failed / announced
 adapters/
-  http_repository   Nuffield booking API (list + book)
+  http_repository   Nuffield booking API (list + book + my bookings)
   auth              Static / Seeded / Browser token providers (Playwright)
   notifiers         WhatsAppNotifier + LogNotifier fallback
   clock             SystemClock
@@ -153,10 +158,12 @@ All settings come from environment variables (or `.env`). See `.env.example`.
 | `BOOKING_CHECK_INTERVAL_SECONDS` | `600` | How often to look for waitlist promotions |
 | `CLASS_TIME_FROM` | `11:00` | Earliest class start (local) |
 | `CLASS_TIME_TO` | `14:00` | Latest class start (local) |
+| `CLASS_DAYS` | `Mon-Fri` | Which days a class may fall on |
 | `POLL_INTERVAL_SECONDS` | `5.0` | Normal poll cadence |
-| `BURST_INTERVAL_SECONDS` | `0.2` | Poll cadence inside the burst |
-| `BURST_JITTER_SECONDS` | `0.15` | Random extra added during burst |
-| `BURST_WINDOW_SECONDS` | `45` | Burst half-width around release |
+| `BURST_INTERVAL_SECONDS` | `1.0` | Poll cadence inside the burst (do not lower) |
+| `BURST_JITTER_SECONDS` | `0.2` | Random extra added during burst |
+| `BURST_LEAD_SECONDS` | `5.0` | How early the burst starts before release |
+| `BURST_WINDOW_SECONDS` | `45` | How long the burst runs after release |
 | `RELEASE_HOUR` / `RELEASE_MINUTE` | `7` / `0` | When bookings open (local) |
 | `TIMEZONE` | `Europe/London` | Timezone for windows |
 | `NOTIFY_WHATSAPP_TOKEN` | unset | WhatsApp Cloud API token |
@@ -168,6 +175,34 @@ If the WhatsApp values are unset, notifications fall back to structured logs.
 `CLASS_NAME_FILTERS` is annotated `NoDecode` because pydantic-settings otherwise
 JSON-parses list fields straight from the environment and rejects the
 comma-separated form.
+
+## Choosing days and times
+
+`CLASS_DAYS` filters on the day the **class** falls on, judged in `TIMEZONE`,
+not the day the bot happens to run. It accepts:
+
+| Form | Example | Means |
+| --- | --- | --- |
+| Single day | `Mon` or `Monday` | Monday only |
+| List | `Mon,Wed,Fri` | those three |
+| Range | `Mon-Fri` | inclusive, may wrap (`Fri-Mon`) |
+| Alias | `weekdays`, `weekends`, `daily` | the obvious thing |
+
+A typo raises at startup rather than matching nothing — a bot that silently
+never books is the worst failure mode here.
+
+The Baltimore Wharf Reformer timetable as observed on 2026-10-16:
+
+| Day | Evening classes (≥17:00) |
+| --- | --- |
+| Mon–Wed | 18:00, 19:00 |
+| Thu | 17:30, 18:30 |
+| Fri | 18:30, 19:30 |
+| Sat, Sun | **none** — mornings and early afternoon only |
+
+So an 18:00 to 20:00 window only ever matches Mon to Fri, and on Thursdays it
+catches just the 18:30. Note the bot still polls on every release; `CLASS_DAYS`
+filters which classes it will act on, it does not skip the run.
 
 ## Notifications
 
@@ -191,9 +226,24 @@ Base host: `https://api.nuffieldhealth.com`. Every call sends
 `Authorization: Bearer <token>` **and** `ocp-apim-subscription-key`.
 
 Retries are deliberately limited to transient failures (5xx, 429, transport
-errors). A 401 is not retried, because each retry would trigger another browser
-login; instead `_request` re-authenticates exactly once, and the provider refuses
-to log in more than once every 30 seconds.
+errors). A rejected token is not retried through tenacity, because each attempt
+would trigger another browser login; instead `_request` re-authenticates exactly
+once, and the provider refuses to log in more than once every 30 seconds.
+
+### Which status means what
+
+The two "denied" cases look similar and mean entirely different things:
+
+| Response | Cause | Handling |
+| --- | --- | --- |
+| `401 Access denied due to missing subscription key` | no `ocp-apim-subscription-key` | always send the key |
+| `403 Invalid Auth Token or Missing Claim(s)` | expired, truncated or garbage bearer token | re-authenticate once |
+| `429 Rate limit is exceeded. Try again in N seconds.` | too many requests | back off by the hinted amount |
+
+**An expired token returns 403, never 401.** Verified against the live API with
+expired, truncated and garbage tokens. Re-authenticating only on 401 therefore
+never fired at all: a stale token failed every tick until the background keeper
+happened to refresh it. `_request` treats both 401 and 403 as "token rejected".
 
 ### Rate limiting: polling competes with booking
 
@@ -209,10 +259,15 @@ The lessons are baked in:
   1s detection loses nothing.
 - **The booking POST is worth fighting for.** `book()` retries for
   `BOOK_RETRY_BUDGET_SECONDS` (25s), honouring the `Retry-After` header or the
-  "try again in N seconds" hint in the body. Listing polls still fail fast after
-  3 attempts so they never hold up the tick loop.
+  "try again in N seconds" hint in the body. Listing polls honour the same hint
+  but give up after 3 attempts, so they never hold up the tick loop.
 - A throttled POST must not be swallowed into a `BookingResult` before the retry
-  wrapper sees it — that bug turned a recoverable 429 into a lost class.
+  wrapper sees it. That bug turned a recoverable 429 into a lost class.
+- **Do not burst long before the drop.** The target day does not exist in the
+  API until the release, so early polling spends quota on guaranteed-empty
+  responses. On 2026-10-16, with a symmetric 45s window, the 429s began 26
+  seconds *before* the release and the bot was blind through the drop. Hence
+  `BURST_LEAD_SECONDS` (5s) separate from `BURST_WINDOW_SECONDS` (45s).
 
 ### Booking response statuses
 
@@ -319,7 +374,11 @@ osascript -e 'tell application "System Events" to get the name of every login it
 ## Going live checklist
 
 1. Fill `.env` (credentials, `AUTO_LOGIN=true`).
-2. Run with `DRY_RUN=true` and confirm it flags the right lunchtime slots.
-3. Set `DRY_RUN=false`, start the container the evening before, and check the
-   startup line says `Bot up (holding until release)` with `Auth OK`.
-4. After the drop: `docker compose logs | grep -E 'booking|slot.found'`.
+2. Set `CLASS_DAYS`, `CLASS_TIME_FROM` and `CLASS_TIME_TO` to the classes you
+   actually want, and check the gym runs them on those days.
+3. Run with `DRY_RUN=true` and confirm it flags the right slots.
+4. Set `DRY_RUN=false`, start the container the evening before, and check the
+   startup line says `Bot up (holding until release)` with `Auth OK` and a
+   sensible `matching class(es)` count.
+5. Keep the machine awake (see above).
+6. After the drop: `docker compose logs | grep -E 'booking|slot.found'`.
